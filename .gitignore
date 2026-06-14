@@ -1,0 +1,46 @@
+# Compiled executables
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+
+# Build folders
+build/
+bin/
+dist/
+
+# VS Code
+.vscode/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+
+# CodeBlocks
+*.cbp
+*.layout
+
+# Dev-C++
+*.dev
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db

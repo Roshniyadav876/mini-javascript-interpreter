@@ -100,16 +100,18 @@ Supported through custom test handler
 
 Supported through custom test handler
 
-## How to Compile
+## How to Run
+
+### Compile
 
 ```bash
 g++ compiler_final.cpp -o compiler_final
 ```
 
-## How to Run
+### Run
 
 ```bash
-./compiler_final
+.\compiler_final
 ```
 
 Then paste JavaScript code and press EOF.
@@ -148,14 +150,12 @@ THUNDER-JS/
 
 Current version does not fully support:
 
-* Nested function call evaluation
 * JavaScript objects
 * Arrow functions
-* Full array API
-* Full string API
+* Advanced array methods (map(), filter(), reduce(), find(), some(), every())
+* Advanced string methods
 * Date object
 * Callback APIs
-* map(), filter(), reduce()
 
 ## Hackathon
 

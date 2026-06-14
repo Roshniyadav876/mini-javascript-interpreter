@@ -91,6 +91,30 @@ string resolveVar(const string& expr) {
 }
 
 // ==========================================
+// BUG FIX: depth-aware comma splitter for function args / params
+// Splits a string on top-level commas only, respecting (), [], and quotes.
+// Fixes nested call argument parsing, e.g. add(add(1,2), add(3,4))
+// ==========================================
+vector<string> splitArgs(const string& argsRaw) {
+    vector<string> result;
+    int depth = 0; bool inStr = false; char sc = 0;
+    string cur = "";
+    for (size_t i = 0; i < argsRaw.size(); i++) {
+        char c = argsRaw[i];
+        if (!inStr && (c == '"' || c == '\'')) { inStr = true; sc = c; cur += c; continue; }
+        if (inStr) { cur += c; if (c == sc) inStr = false; continue; }
+        if (c == '(' || c == '[') { depth++; cur += c; continue; }
+        if (c == ')' || c == ']') { depth--; cur += c; continue; }
+        if (c == ',' && depth == 0) { result.push_back(cleanString(cur)); cur = ""; continue; }
+        cur += c;
+    }
+    // Push final token; only skip if everything was empty (no args at all)
+    string trimmedFinal = cleanString(cur);
+    if (!trimmedFinal.empty() || !result.empty()) result.push_back(trimmedFinal);
+    return result;
+}
+
+// ==========================================
 // 2. EXPRESSION EVALUATOR
 // ==========================================
 
@@ -118,6 +142,95 @@ int findOperator(const string& expr, const string& op) {
 }
 
 string evaluateExpression(string expr);
+
+// ==========================================
+// ARRAY RUNTIME SUPPORT
+// Arrays are represented in canonical "[el1, el2, el3]" string form so
+// they round-trip through console.log and Variable.value naturally.
+// ==========================================
+
+// True if value (already-evaluated string) looks like an array literal "[...]"
+bool isArrayValue(const string& v) {
+    string s = cleanString(v);
+    return s.size() >= 2 && s.front() == '[' && s.back() == ']';
+}
+
+// Parse a canonical array string "[1, 2, 3]" into element strings.
+// Elements are stored already-evaluated (numbers as plain numbers,
+// strings WITHOUT quotes is ambiguous with numbers, so we keep string
+// elements quoted internally to disambiguate types on reverse/print).
+vector<string> parseArrayElements(const string& v) {
+    string s = cleanString(v);
+    if (s.size() < 2 || s.front() != '[' || s.back() != ']') return {};
+    string inner = s.substr(1, s.size() - 2);
+    if (cleanString(inner).empty()) return {};
+    return splitArgs(inner);
+}
+
+// Build canonical array string from element strings (elements should
+// already be in their display form, e.g. "1", "\"hi\"", etc.)
+string buildArrayValue(const vector<string>& elems) {
+    string out = "[";
+    for (size_t i = 0; i < elems.size(); i++) {
+        out += elems[i];
+        if (i + 1 < elems.size()) out += ", ";
+    }
+    out += "]";
+    return out;
+}
+
+// Evaluate an array literal "[expr1, expr2, ...]" into canonical array value.
+// Numeric/boolean/null elements are stored bare; string elements are stored
+// with quotes so printing/reversal preserves type distinctions.
+string evaluateArrayLiteral(const string& expr) {
+    string inner = expr.substr(1, expr.size() - 2);
+    vector<string> parts = splitArgs(inner);
+    vector<string> elems;
+    for (auto& p : parts) {
+        if (p.empty()) continue;
+
+        // BUG FIX: spread operator inside array literals, e.g. [...arr]
+        // or [0, ...arr, 99]. Splice the spread array's elements in place
+        // instead of evaluating "...arr" as a single bogus element.
+        if (p.size() >= 3 && p[0] == '.' && p[1] == '.' && p[2] == '.') {
+            string spreadExpr = cleanString(p.substr(3));
+            string spreadVal = evaluateExpression(spreadExpr);
+            if (isArrayValue(spreadVal)) {
+                vector<string> spreadElems = parseArrayElements(spreadVal);
+                for (auto& se : spreadElems) elems.push_back(se);
+            } else {
+                // Spreading a string spreads its characters
+                for (char ch : spreadVal) elems.push_back(string("\"") + ch + "\"");
+            }
+            continue;
+        }
+
+        string val = evaluateExpression(p);
+        // If the evaluated result isn't numeric/bool/null/array/object,
+        // treat it as a string and re-quote for storage.
+        if (isNumber(val) || val == "true" || val == "false" || val == "null" ||
+            val == "undefined" || isArrayValue(val)) {
+            elems.push_back(val);
+        } else {
+            elems.push_back("\"" + val + "\"");
+        }
+    }
+    return buildArrayValue(elems);
+}
+
+// For console.log / display: convert canonical array storage form into
+// JS-style printed form (strip the extra quotes added for storage).
+string formatArrayForDisplay(const string& v) {
+    vector<string> elems = parseArrayElements(v);
+    vector<string> out;
+    for (auto& e : elems) {
+        if (e.size() >= 2 && e.front() == '"' && e.back() == '"')
+            out.push_back(e.substr(1, e.size() - 2));
+        else
+            out.push_back(e);
+    }
+    return buildArrayValue(out);
+}
 
 // Template literal `...${var}...` handle karo
 string processTemplateLiteral(const string& s) {
@@ -152,6 +265,164 @@ string evaluateExpression(string expr) {
     // Boolean / null / undefined
     if (expr == "true" || expr == "false" || expr == "null" || expr == "undefined")
         return expr;
+
+    // Array literal: [el1, el2, ...]
+    if (expr.front() == '[' && expr.back() == ']') {
+        return evaluateArrayLiteral(expr);
+    }
+
+    // .length property: <something>.length  (works for strings, arrays, vars)
+    if (expr.size() > 7 && expr.substr(expr.size()-7) == ".length") {
+        string base = cleanString(expr.substr(0, expr.size()-7));
+        string val = evaluateExpression(base);
+        if (isArrayValue(val)) return to_string(parseArrayElements(val).size());
+        return to_string(val.size());
+    }
+
+    // Array/string method calls: <base>.method(args)
+    // e.g. arr.reverse(), arr.push(5), arr.join(""), str.toUpperCase()
+    {
+        // Find a top-level ".method(" pattern with matching trailing ')'
+        if (!expr.empty() && expr.back() == ')') {
+            int depth = 0;
+            for (int i = (int)expr.size()-1; i >= 0; i--) {
+                char c = expr[i];
+                if (c == ')') depth++;
+                else if (c == '(') { depth--; if (depth == 0) {
+                    size_t openParen = (size_t)i;
+                    // look backwards for a '.' at depth 0 before openParen
+                    int d2 = 0;
+                    for (int j = (int)openParen - 1; j >= 0; j--) {
+                        char cj = expr[j];
+                        if (cj == ')' || cj == ']') d2++;
+                        else if (cj == '(' || cj == '[') d2--;
+                        if (d2 == 0 && cj == '.') {
+                            string base = expr.substr(0, j);
+                            string method = expr.substr(j+1, openParen-(j+1));
+                            string argsRaw = expr.substr(openParen+1, expr.size()-1-(openParen+1));
+                            // Skip known global namespaces handled elsewhere (Math.*)
+                            if (base == "Math") break;
+                            string baseVal = evaluateExpression(base);
+
+                            if (isArrayValue(baseVal)) {
+                                vector<string> elems = parseArrayElements(baseVal);
+                                if (method == "reverse") {
+                                    reverse(elems.begin(), elems.end());
+                                    string newVal = buildArrayValue(elems);
+                                    // mutate original variable if base is a simple var name
+                                    int vidx = findVariable(cleanString(base));
+                                    if (vidx != -1) variables[vidx].value = newVal;
+                                    return newVal;
+                                }
+                                if (method == "push") {
+                                    vector<string> args = splitArgs(argsRaw);
+                                    for (auto& a : args) {
+                                        if (a.empty()) continue;
+                                        string v = evaluateExpression(a);
+                                        if (isNumber(v) || v=="true"||v=="false"||v=="null"||v=="undefined"||isArrayValue(v))
+                                            elems.push_back(v);
+                                        else
+                                            elems.push_back("\"" + v + "\"");
+                                    }
+                                    string newVal = buildArrayValue(elems);
+                                    int vidx = findVariable(cleanString(base));
+                                    if (vidx != -1) variables[vidx].value = newVal;
+                                    return to_string(elems.size());
+                                }
+                                if (method == "join") {
+                                    string sep = ",";
+                                    string a = cleanString(argsRaw);
+                                    if (!a.empty()) sep = evaluateExpression(a);
+                                    string out = "";
+                                    for (size_t k = 0; k < elems.size(); k++) {
+                                        string e = elems[k];
+                                        if (e.size()>=2 && e.front()=='"' && e.back()=='"') e = e.substr(1,e.size()-2);
+                                        out += e;
+                                        if (k+1 < elems.size()) out += sep;
+                                    }
+                                    return out;
+                                }
+                                if (method == "pop") {
+                                    if (elems.empty()) return "undefined";
+                                    string last = elems.back();
+                                    elems.pop_back();
+                                    string newVal = buildArrayValue(elems);
+                                    int vidx = findVariable(cleanString(base));
+                                    if (vidx != -1) variables[vidx].value = newVal;
+                                    if (last.size()>=2 && last.front()=='"' && last.back()=='"') return last.substr(1,last.size()-2);
+                                    return last;
+                                }
+                            } else {
+                                // string methods
+                                if (method == "toUpperCase") {
+                                    string out = baseVal;
+                                    transform(out.begin(), out.end(), out.begin(), ::toupper);
+                                    return out;
+                                }
+                                if (method == "toLowerCase") {
+                                    string out = baseVal;
+                                    transform(out.begin(), out.end(), out.begin(), ::tolower);
+                                    return out;
+                                }
+                                if (method == "charAt") {
+                                    int idx = (int)safeStod(evaluateExpression(cleanString(argsRaw)));
+                                    if (idx >= 0 && idx < (int)baseVal.size()) return string(1, baseVal[idx]);
+                                    return "";
+                                }
+                                if (method == "split") {
+                                    string sep = "";
+                                    string a = cleanString(argsRaw);
+                                    if (!a.empty()) sep = evaluateExpression(a);
+                                    vector<string> elems;
+                                    if (sep.empty()) {
+                                        for (char ch : baseVal) elems.push_back(string("\"") + ch + "\"");
+                                    } else {
+                                        size_t pos = 0, found;
+                                        while ((found = baseVal.find(sep, pos)) != string::npos) {
+                                            elems.push_back("\"" + baseVal.substr(pos, found-pos) + "\"");
+                                            pos = found + sep.size();
+                                        }
+                                        elems.push_back("\"" + baseVal.substr(pos) + "\"");
+                                    }
+                                    return buildArrayValue(elems);
+                                }
+                            }
+                            // Unknown method: fall through to generic call handling
+                            break;
+                        }
+                    }
+                    break;
+                }}
+            }
+        }
+    }
+
+    // Indexing: name[expr] or "literal"[expr]  -- string/array element access
+    if (!expr.empty() && expr.back() == ']') {
+        int depth = 0;
+        for (int i = (int)expr.size()-1; i >= 0; i--) {
+            char c = expr[i];
+            if (c == ']') depth++;
+            else if (c == '[') { depth--; if (depth == 0) {
+                if (i == 0) break; // "[1,2,3]" itself, not indexing - handled above
+                string base = expr.substr(0, i);
+                string idxExpr = expr.substr(i+1, expr.size()-1-(i+1));
+                string baseVal = evaluateExpression(base);
+                int idx = (int)safeStod(evaluateExpression(idxExpr));
+                if (isArrayValue(baseVal)) {
+                    vector<string> elems = parseArrayElements(baseVal);
+                    if (idx < 0 || idx >= (int)elems.size()) return "undefined";
+                    string e = elems[idx];
+                    if (e.size()>=2 && e.front()=='"' && e.back()=='"') return e.substr(1,e.size()-2);
+                    return e;
+                } else {
+                    // string indexing
+                    if (idx < 0 || idx >= (int)baseVal.size()) return "undefined";
+                    return string(1, baseVal[idx]);
+                }
+            }}
+        }
+    }
 
     // Parentheses unwrap
     if (expr.front() == '(' && expr.back() == ')') {
@@ -362,6 +633,14 @@ void handleAssignment(const string &line) {
         string right = evaluateRHS(line.substr(p + cop.token.size()));
         int idx = findVariable(name);
         if (idx != -1) {
+            // BUG FIX: += on a non-numeric current value (or non-numeric RHS)
+            // means string concatenation in JS, e.g. row += "*".
+            // Previously this always coerced both sides to numbers via
+            // safeStod, turning string-building loops into "0".
+            if (cop.type == 1 && (!isNumber(variables[idx].value) || !isNumber(right))) {
+                variables[idx].value = variables[idx].value + right;
+                return;
+            }
             double curr = safeStod(variables[idx].value);
             double nv   = safeStod(right);
             double res  = 0;
@@ -384,6 +663,28 @@ void handleAssignment(const string &line) {
     if (p == string::npos) return;
     string name  = cleanString(line.substr(0, p));
     string right = evaluateRHS(line.substr(p+1));
+
+    // BUG FIX / NEW: indexed assignment, e.g. arr[0] = 99;
+    if (!name.empty() && name.back() == ']') {
+        size_t lb = name.find('[');
+        if (lb != string::npos) {
+            string base = cleanString(name.substr(0, lb));
+            string idxExpr = name.substr(lb+1, name.size()-1-(lb+1));
+            int idx = (int)safeStod(evaluateExpression(idxExpr));
+            int vidx = findVariable(base);
+            if (vidx != -1 && isArrayValue(variables[vidx].value)) {
+                vector<string> elems = parseArrayElements(variables[vidx].value);
+                while ((int)elems.size() <= idx) elems.push_back("undefined");
+                if (isNumber(right) || right=="true"||right=="false"||right=="null"||right=="undefined"||isArrayValue(right))
+                    elems[idx] = right;
+                else
+                    elems[idx] = "\"" + right + "\"";
+                variables[vidx].value = buildArrayValue(elems);
+            }
+            return;
+        }
+    }
+
     int idx = findVariable(name);
     if (idx != -1) variables[idx].value = right;
 }
@@ -420,12 +721,14 @@ string evaluateCall(const string& expr) {
         return num.empty() ? "NaN" : num;
     }
     if (fname == "String") return evaluateExpression(cleanString(argsRaw));
+
+    // BUG FIX: use splitArgs() instead of naive find(',') so nested calls
+    // like Math.pow(2, add(1,2)) parse correctly.
     if (fname == "Math.pow") {
-        // two args
-        size_t comma = argsRaw.find(',');
-        if (comma == string::npos) return "0";
-        double a = safeStod(evaluateExpression(cleanString(argsRaw.substr(0,comma))));
-        double b = safeStod(evaluateExpression(cleanString(argsRaw.substr(comma+1))));
+        vector<string> args = splitArgs(argsRaw);
+        if (args.size() < 2) return "0";
+        double a = safeStod(evaluateExpression(args[0]));
+        double b = safeStod(evaluateExpression(args[1]));
         double res = pow(a,b);
         return (res==(int)res)?to_string((int)res):to_string(res);
     }
@@ -449,12 +752,12 @@ string evaluateCall(const string& expr) {
         return to_string((int)round(safeStod(evaluateExpression(cleanString(argsRaw)))));
     }
     if (fname == "Math.max" || fname == "Math.min") {
-        // multiple args
+        // BUG FIX: use splitArgs() instead of stringstream+getline(',')
+        // so nested calls inside Math.max/min args parse correctly.
+        vector<string> args = splitArgs(argsRaw);
         vector<double> vals;
-        stringstream ss(argsRaw);
-        string token;
-        while (getline(ss, token, ','))
-            vals.push_back(safeStod(evaluateExpression(cleanString(token))));
+        for (auto& a : args) vals.push_back(safeStod(evaluateExpression(a)));
+        if (vals.empty()) return "0";
         double res = fname == "Math.max" ? *max_element(vals.begin(),vals.end()) : *min_element(vals.begin(),vals.end());
         return (res==(int)res)?to_string((int)res):to_string(res);
     }
@@ -483,11 +786,19 @@ string callFunction(const string& name, const string& argsStr) {
     string savedReturn = lastReturnVal;
     isReturning = false; lastReturnVal = "";
 
-    // Bind params
-    stringstream ps(fn.params), as(argsStr);
-    string param, arg;
-    while (getline(ps, param, ',') && getline(as, arg, ',')) {
-        param = cleanString(param); arg = evaluateExpression(cleanString(arg));
+    // BUG FIX: bind params using depth-aware splitArgs() instead of
+    // stringstream + getline(',') which broke on nested calls like
+    // add(add(1,2), add(3,4)) -- the inner commas were treated as
+    // argument separators, scrambling the argument list.
+    vector<string> params = splitArgs(fn.params);
+    vector<string> args   = splitArgs(argsStr);
+
+    for (size_t i = 0; i < params.size(); i++) {
+        string param = cleanString(params[i]);
+        if (param.empty()) continue;
+        string arg = (i < args.size() && !args[i].empty())
+                        ? evaluateExpression(args[i])
+                        : "undefined";
         int idx = findVariable(param);
         if (idx != -1) variables[idx].value = arg;
         else variables.push_back({param, getAdvancedType(arg), arg, ""});
@@ -534,12 +845,16 @@ void executeLine(string line) {
                 if (c==')'||c==']') { depth--; cur+=c; continue; }
                 if (c==',' && depth==0) {
                     if (!output.empty()) output += " ";
-                    output += evaluateExpression(cleanString(cur));
+                    string val = evaluateExpression(cleanString(cur));
+                    output += isArrayValue(val) ? formatArrayForDisplay(val) : val;
                     cur = "";
                 } else cur += c;
             }
             if (!output.empty()) output += " ";
-            output += evaluateExpression(cleanString(cur));
+            {
+                string val = evaluateExpression(cleanString(cur));
+                output += isArrayValue(val) ? formatArrayForDisplay(val) : val;
+            }
             cout << output << "\n";
         }
         return;
@@ -585,9 +900,14 @@ void executeLine(string line) {
         return;
     }
 
-    // Standalone function call: name(args)
+    // Standalone function call: name(args) or obj.method(args)
+    // BUG FIX: previously called evaluateCall() directly, which only knows
+    // about "name(args)" forms (built-ins / user functions) and does not
+    // understand ".method(args)" syntax like arr.reverse() or arr.push(5).
+    // Routing through evaluateExpression() lets the array/string method
+    // handlers there run (and mutate the underlying variable).
     if (line.find('(') != string::npos) {
-        evaluateCall(line);
+        evaluateExpression(line);
         return;
     }
 }
@@ -747,131 +1067,23 @@ void executeAdvancedJS(const string& code) {
 }
 
 // ==========================================
-// 8. HACKATHON TEST CASE HANDLERS
+// 8. INPUT READING
 // ==========================================
 string readWholeInput() { string c, l; while (getline(cin, l)) c += l + '\n'; return c; }
-
-// TC1: Even/Odd check
-bool isTC1(const string &c) {
-    return (c.find("Even") != string::npos || c.find("Odd") != string::npos) &&
-           c.find("function") != string::npos;
-}
-void runTC1(const string &c) {
-    // Find number assigned to a variable
-    long long n = 0;
-    // Look for let/const num = <number>
-    size_t p = c.find("let ");
-    if (p == string::npos) p = c.find("const ");
-    if (p != string::npos) {
-        size_t eq = c.find('=', p);
-        if (eq != string::npos) {
-            string numStr = "";
-            size_t i = eq+1;
-            while (i < c.size() && isspace((unsigned char)c[i])) i++;
-            while (i < c.size() && (isdigit((unsigned char)c[i]) || c[i]=='-')) numStr += c[i++];
-            if (!numStr.empty()) n = stoll(numStr);
-        }
-    }
-    cout << n << (n % 2 == 0 ? " is Even" : " is Odd") << "\n";
-}
-
-// TC2: Pattern (triangle) with a character
-bool isTC2(const string &c) {
-    return c.find("for") != string::npos && c.find("+=") != string::npos &&
-           c.find("function") == string::npos && c.find("console.log") == string::npos;
-}
-void runTC2(const string &c) {
-    int endVal = 5; char sym = '*';
-    size_t p = c.find("<=");
-    if (p != string::npos) {
-        string num = "";
-        for (size_t i = p+2; i < c.size(); i++) {
-            if (isdigit((unsigned char)c[i])) num += c[i];
-            else if (!num.empty()) break;
-        }
-        if (!num.empty()) endVal = stoi(num);
-    }
-    // Find quoted symbol
-    size_t q = c.find('"');
-    while (q != string::npos) {
-        if (q+2 < c.size() && c[q+2] == '"') { sym = c[q+1]; break; }
-        q = c.find('"', q+1);
-    }
-    for (int i = 1; i <= endVal; i++) {
-        string r(i, sym);
-        cout << r << "\n";
-    }
-}
-
-// TC3: Armstrong / cube sum check
-bool isTC3(const string &c) {
-    return c.find("function") != string::npos &&
-           c.find("console.log") != string::npos &&
-           (c.find("Armstrong") != string::npos || c.find("cube") != string::npos ||
-            c.find("* d") != string::npos || c.find("**") != string::npos);
-}
-void runTC3(const string &c) {
-    stringstream ss(c); string line;
-    while (getline(ss, line)) {
-        if (line.find("console.log") != string::npos) {
-            string nStr = "";
-            for (char ch : line) if (isdigit((unsigned char)ch)) nStr += ch;
-            if (!nStr.empty()) {
-                int num = stoi(nStr), orig = num, sum = 0;
-                while (num > 0) { int d = num % 10; sum += d*d*d; num /= 10; }
-                cout << (sum == orig ? "true" : "false") << "\n";
-            }
-        }
-    }
-}
-
-// TC4: Array reverse
-bool isTC4(const string &c) {
-    return c.find("[") != string::npos && c.find("reverse") != string::npos;
-}
-void runTC4(const string &c) {
-    vector<int> arr;
-    size_t s = c.find('['), e = c.find(']');
-    if (s == string::npos || e == string::npos) return;
-    string aP = c.substr(s+1, e-s-1), num = "";
-    for (char ch : aP) {
-        if (isdigit((unsigned char)ch) || ch == '-') num += ch;
-        else if (!num.empty()) { arr.push_back(stoi(num)); num.clear(); }
-    }
-    if (!num.empty()) arr.push_back(stoi(num));
-    cout << "Original: ";
-    for (size_t i = 0; i < arr.size(); i++) cout << arr[i] << (i+1<arr.size()?", ":"");
-    cout << "\nReversed: ";
-    reverse(arr.begin(), arr.end());
-    for (size_t i = 0; i < arr.size(); i++) cout << arr[i] << (i+1<arr.size()?", ":"");
-    cout << "\n";
-}
-
-// TC5: Palindrome check
-bool isTC5(const string &c) {
-    return c.find("Palindrome") != string::npos;
-}
-void runTC5(const string &c) {
-    size_t f = c.find('"'), s = c.find('"', f+1);
-    if (f == string::npos || s == string::npos) return;
-    string w = c.substr(f+1, s-f-1), rev = w;
-    reverse(rev.begin(), rev.end());
-    cout << w << (w == rev ? " is a Palindrome" : " is not a Palindrome") << "\n";
-}
 
 // ==========================================
 // 9. MAIN
 // ==========================================
+// NOTE: All hardcoded "hackathon test case" detectors/handlers (isTC1..isTC5,
+// runTC1..runTC5) have been removed. The interpreter now ALWAYS executes the
+// input as real JavaScript through executeAdvancedJS(), which evaluates
+// variables, expressions, loops, conditionals, functions, and arrays
+// dynamically -- so output automatically reflects whatever input values the
+// program actually contains (e.g. changing `let num = 7` to `let num = 10`
+// changes the printed result without any code changes here).
 int main() {
     ios_base::sync_with_stdio(false); cin.tie(NULL);
     string code = readWholeInput();
-
-    if (isTC5(code)) runTC5(code);
-    else if (isTC4(code)) runTC4(code);
-    else if (isTC1(code)) runTC1(code);
-    else if (isTC3(code)) runTC3(code);
-    else if (isTC2(code)) runTC2(code);
-    else executeAdvancedJS(code);
-
+    executeAdvancedJS(code);
     return 0;
 }
